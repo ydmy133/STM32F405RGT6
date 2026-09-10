@@ -580,6 +580,16 @@
               <FilePath>..\User\gnss_sensor.h</FilePath>
             </File>
             <File>
+              <FileName>gnss_pos_filter.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\gnss_pos_filter.c</FilePath>
+            </File>
+            <File>
+              <FileName>gnss_pos_filter.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\User\gnss_pos_filter.h</FilePath>
+            </File>
+            <File>
               <FileName>heading_sensor.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\User\heading_sensor.c</FilePath>

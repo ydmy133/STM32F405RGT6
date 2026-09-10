@@ -30,6 +30,7 @@
 #include "led.h"          /**< LED驱动模块 */
 #include "protocol.h"     /**< 无人船通信模块 */
 #include "gnss_sensor.h"  /**< GNSS传感器驱动模块 */
+#include "gnss_pos_filter.h" /**< GNSS经纬度三层滤波 */
 #include "heading_sensor.h" /**< 航向角传感器驱动模块 */
 #include "navigation_controller.h" /**< 导航控制器模块 */
 #include "bms_sensor.h"   /**< BMS电池保护板Modbus驱动模块 */
@@ -127,6 +128,8 @@ static void System_UpdateNavigation(void);  /**< 更新导航控制器 */
 static void System_SetSpeed(int8_t move, int8_t steer); /**< 设置行进速度和转向速度 */
 static void System_SendDriverCommand(int8_t move_speed, int8_t turn_speed); /**< 发送控制指令到驱动板 */
 static void System_CheckAutoReturn(void); /**< 检查并执行自动返航逻辑 */
+static uint8_t System_NavActive(void);      /**< 当前是否在用 GNSS 做导航闭环 */
+static void System_GetNavLatLon(double *lat, double *lon); /**< 速度环用的滤波后经纬度 */
 /** @} */
 /* USER CODE END PFP */
 
@@ -178,6 +181,7 @@ int main(void)
   LED_Init();                   /* LED初始化 */
   LED_Blink(100, 10);           /* LED闪烁10次，间隔100ms，表示系统启动 */
   GNSSSensor_Init();            /* GNSS传感器初始化 */
+  GNSSPosFilter_Init();         /* 经纬度滤波初始化 */
   HeadingSensor_Init();         /* 航向角传感器初始化 */
   NavigationController_Init();  /* 导航控制器初始化 */
   BMSSensor_Init();             /* BMS电池保护板传感器初始化 */
@@ -312,6 +316,43 @@ static void System_SendDriverCommand(int8_t move_speed, int8_t turn_speed)
 }
 
 /**
+ * @brief  当前是否在用 GNSS 位置做导航闭环
+ */
+static uint8_t System_NavActive(void)
+{
+    if (s_return_home_active || s_low_battery_return_active || s_disconnect_stable_active) {
+        return 1u;
+    }
+    if (s_command.control_mode == CONTROL_MODE_NAVIGATE ||
+        s_command.control_mode == CONTROL_MODE_STABLE_ANCHOR ||
+        s_command.control_mode == CONTROL_MODE_FIXED_POINT ||
+        s_command.control_mode == CONTROL_MODE_CRUISE_DIR) {
+        return 1u;
+    }
+    return 0u;
+}
+
+/**
+ * @brief  速度环用的当前经纬度(滤波后;尚未就绪则回退原始)
+ */
+static void System_GetNavLatLon(double *lat, double *lon)
+{
+    float f_lat;
+    float f_lon;
+
+    if ((lat == 0) || (lon == 0)) {
+        return;
+    }
+    if (GNSSPosFilter_Get(&f_lat, &f_lon) != 0u) {
+        *lat = (double)f_lat;
+        *lon = (double)f_lon;
+        return;
+    }
+    *lat = (double)s_gnss.latitude;
+    *lon = (double)s_gnss.longitude;
+}
+
+/**
  * @brief  轮流更新传感器数据，每50ms更新一个
  * @retval None
  * @note   在主循环中调用，交替更新GNSS传感器和航向角传感器
@@ -324,6 +365,7 @@ static void System_UpdateSensors(void)
     static uint8_t sensor_index = 0;        /* 只在程序启动时初始化一次 */
     static uint8_t gnss_anomaly_count = 0;  /* GNSS 连续异常计数 */
     static uint8_t heading_anomaly_count = 0; /* 航向传感器连续异常计数 */
+    static uint32_t gnss_ok_tick = 0;       /* 上次 GNSS 成功采样时刻 */
     uint32_t current_tick = HAL_GetTick();
 
     /* 检查是否到达更新时间（50ms间隔） */
@@ -335,13 +377,29 @@ static void System_UpdateSensors(void)
     /* 轮流更新传感器 */
     switch (sensor_index) {
         case 0:
-            /* 更新GNSS传感器数据,统计异常 */
-            if (GNSSSensor_Update() != GNSS_SENSOR_OK) {
-                if (gnss_anomaly_count < 255u) gnss_anomaly_count++;
-            } else {
-                gnss_anomaly_count = 0;
+            /* 更新GNSS传感器数据,统计异常;成功则推进经纬度滤波 */
+            {
+                GNSSSensor_Status_t gnss_st = GNSSSensor_Update();
+                float dt_s;
+                float dist_m;
+
+                if (gnss_st != GNSS_SENSOR_OK) {
+                    if (gnss_anomaly_count < 255u) gnss_anomaly_count++;
+                } else {
+                    gnss_anomaly_count = 0;
+                }
+                s_gnss = GNSSSensor_GetData();
+                if (gnss_st == GNSS_SENSOR_OK) {
+                    dt_s = 0.1f;
+                    if (gnss_ok_tick != 0u) {
+                        dt_s = (float)(current_tick - gnss_ok_tick) * 0.001f;
+                    }
+                    gnss_ok_tick = current_tick;
+                    dist_m = System_NavActive() ? (float)s_nav_status.distance : -1.0f;
+                    GNSSPosFilter_Update(s_gnss.latitude, s_gnss.longitude,
+                                         s_gnss.speed / 3.6f, dt_s, dist_m);
+                }
             }
-            s_gnss = GNSSSensor_GetData();
             break;
         case 1:
             /* 更新航向角传感器数据,统计异常 */
@@ -440,7 +498,10 @@ static void System_ProcessCommand(void)
             {
                 /* 稳泊模式：模式切换时，将当前坐标设置为导航目标 */
                 if (s_last_mode != s_command.control_mode) {
-                    NavigationController_SetTarget(s_gnss.latitude, s_gnss.longitude);
+                    double lock_lat;
+                    double lock_lon;
+                    System_GetNavLatLon(&lock_lat, &lock_lon);
+                    NavigationController_SetTarget(lock_lat, lock_lon);
                 }
                 break;
             }
@@ -454,9 +515,12 @@ static void System_ProcessCommand(void)
             {
                 /* 定向巡航：模式切换时记录当前航向为基准，计算初始目标点 */
                 if (s_last_mode != s_command.control_mode) {
+                    double here_lat;
+                    double here_lon;
                     s_dir_cruise_base_heading = s_heading.yaw;
+                    System_GetNavLatLon(&here_lat, &here_lon);
                     NavigationController_CalculateTargetPosition(
-                        s_gnss.latitude, s_gnss.longitude,
+                        here_lat, here_lon,
                         s_dir_cruise_base_heading,
                         DIR_CRUISE_STEP_DISTANCE,
                         &s_dir_cruise_target_lat, &s_dir_cruise_target_lon);
@@ -498,7 +562,12 @@ static void System_CheckAutoReturn(void)
             if (!s_disconnect_stable_active && !s_return_home_active && !s_low_battery_return_active) {
                 s_disconnect_stable_active = 1;
                 NavigationController_SetMaxSpeed(NAV_DEFAULT_MAX_SPEED);
-                NavigationController_SetTarget(s_gnss.latitude, s_gnss.longitude);
+                {
+                    double lock_lat;
+                    double lock_lon;
+                    System_GetNavLatLon(&lock_lat, &lock_lon);
+                    NavigationController_SetTarget(lock_lat, lock_lon);
+                }
                 MAIN_DBG("Disconnect detected (no prot), entering stable anchor\r\n");
             }
         #else
@@ -543,12 +612,8 @@ static void System_UpdateNavigation(void)
     }
     last_update_tick = current_tick;
 
-    /* 仅在导航模式、稳泊模式、定点抛锚模式、定向巡航模式、断连返航、低电量返航或断连稳泊激活时执行导航控制计算 */
-    if (!s_return_home_active && !s_low_battery_return_active && !s_disconnect_stable_active &&
-        s_command.control_mode != CONTROL_MODE_NAVIGATE &&
-        s_command.control_mode != CONTROL_MODE_STABLE_ANCHOR &&
-        s_command.control_mode != CONTROL_MODE_FIXED_POINT &&
-        s_command.control_mode != CONTROL_MODE_CRUISE_DIR) {
+    /* 仅在导航相关模式、断连返航、低电量返航或断连稳泊时执行导航控制计算 */
+    if (!System_NavActive()) {
         return;
     }
 
@@ -557,8 +622,13 @@ static void System_UpdateNavigation(void)
     while (normalized_heading < 0.0f) normalized_heading += 360.0f;
     while (normalized_heading >= 360.0f) normalized_heading -= 360.0f;
 
-    /* 串级PI:第4参为偏航角速度(°/s),作为转向内环反馈(移植自 control_borad) */
-    NavigationController_Update(s_gnss.latitude, s_gnss.longitude, normalized_heading, s_heading.gz);
+    /* 串级PI:位置用滤波后经纬度,角速度(°/s)作转向内环反馈 */
+    {
+        double nav_lat;
+        double nav_lon;
+        System_GetNavLatLon(&nav_lat, &nav_lon);
+        NavigationController_Update(nav_lat, nav_lon, normalized_heading, s_heading.gz);
+    }
 
     /* 先更新导航状态信息，确保后续判断使用最新数据 */
     s_nav_status = NavigationController_GetStatus();
@@ -621,8 +691,8 @@ static void System_UpdateTelemetry(void)
     s_telemetry.roll = s_heading.roll;                  /* 翻滚角，范围[-180, 180] */
     s_telemetry.pitch = s_heading.pitch;                /* 俯仰角，范围[-90, 90] */
     s_telemetry.battery_level = s_battery_level;        /* 电池电量百分比(RSOC)，范围0~100 */
-    s_telemetry.dev_lat = s_gnss.latitude;              /* 当前纬度（WGS84） */
-    s_telemetry.dev_lon = s_gnss.longitude;             /* 当前经度（WGS84） */
+    s_telemetry.dev_lat = s_gnss.latitude;              /* 原始纬度（未滤波，便于对照） */
+    s_telemetry.dev_lon = s_gnss.longitude;             /* 原始经度（未滤波，便于对照） */
     s_telemetry.speed = s_gnss.speed / 3.6f;            /* 对地速度，km/h转m/s */
     s_telemetry.altitude = s_gnss.height;               /* 海拔高度，单位: m */
     s_telemetry.gyro_z = s_heading.gz;                  /* 实测偏航角速度，单位: °/s */
